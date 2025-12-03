@@ -11,122 +11,231 @@ use Illuminate\Validation\Rule;
 
 class ProductController extends Controller
 {
+    /**
+     * GET /api/owner/products
+     *
+     * Optional filters:
+     *  - search       (by name or sku)
+     *  - category_id  (int)
+     *  - status       (active|inactive|all) - default: active
+     *  - sku          (string) - optional filter for fetching product by SKU
+     *  - page         (for pagination; if absent, returns full collection)
+     */
     public function index(Request $request)
     {
-        // Include relations so Vue can show category + brand names
-        $query = Product::where('status', 'active')
-            ->with(['category', 'brand']);
+        $query = Product::query()->with(['category', 'brand']); // Eager load category and brand relationships
 
-        if ($search = $request->search) {
+        // SKU filter (if provided in query params)
+        if ($sku = $request->get('sku')) {
+            $query->where('sku', $sku);
+        }
+
+        // Status filter (default: active)
+        $status = $request->get('status', 'active');
+        if ($status !== 'all') {
+            $query->where('status', $status);
+        }
+
+        // Search filter
+        if ($search = $request->get('search')) {
             $query->where(function ($q) use ($search) {
-                $q->where('name', 'like', "%$search%")
-                    ->orWhere('sku', 'like', "%$search%");
+                $q->where('name', 'like', "%{$search}%")
+                    ->orWhere('sku', 'like', "%{$search}%");
             });
         }
 
-        if ($request->category_id) {
-            $query->where('product_category_id', $request->category_id);
+        // Category filter
+        if ($categoryId = $request->get('category_id')) {
+            $query->where('product_category_id', $categoryId); // Filter by category ID
         }
 
-        return $request->page
-            ? $query->paginate(15)
-            : $query->get();
+        // Basic ordering by ID
+        $query->orderBy('id', 'asc');
+
+        // If page param is present, return paginated list; otherwise full list
+        if ($request->has('page')) {
+            // Paginate the results with 15 items per page
+            $products = $query->paginate(15);
+        } else {
+            // Return all products matching the filters
+            $products = $query->get();
+        }
+
+        // Return the results in a JSON format
+        return response()->json(['data' => $products]);
     }
 
+    /**
+     * POST /api/owner/products
+     *
+     * Create new product.
+     */
     public function store(Request $request)
     {
         $data = $request->validate([
             'product_category_id' => ['required', 'integer', 'exists:product_categories,id'],
-            'brand_id'            => ['nullable', 'integer', 'exists:brands,id'],
-            'sku'                 => ['nullable', 'string', 'max:100', Rule::unique('products')->whereNull('deleted_at')],
-            'name'                => ['required', 'string', 'max:255', Rule::unique('products')->whereNull('deleted_at')],
-            'cost_price'          => ['required', 'numeric', 'min:0'],
-            'selling_price'       => ['required', 'numeric', 'min:0'],
+            'brand_id' => ['required', 'integer', 'exists:brands,id'],  // Make brand_id required
+            'sku' => [
+                'required',  // Make SKU required
+                'string',
+                'max:100',
+                Rule::unique('products')->whereNull('deleted_at'),
+            ],
+            'name' => [
+                'required',
+                'string',
+                'max:255',
+                Rule::unique('products')
+                    ->whereNull('deleted_at')
+                    ->where(function ($query) use ($request) {
+                        // Enforce unique combination of product name, brand, and SKU
+                        $query->where('name', $request->name)
+                            ->where('brand_id', $request->brand_id)
+                            ->where('sku', $request->sku);
+                    }),
+            ],
+            'cost_price' => ['required', 'numeric', 'min:0'],
+            'selling_price' => ['required', 'numeric', 'min:0'],
+            'current_stock' => ['nullable', 'numeric', 'min:0'],
+            'reorder_level' => ['nullable', 'numeric', 'min:0'], // Keep reorder_level as nullable
         ]);
 
-        // Decide base_unit based on category name (feeds vs others)
-        $category   = ProductCategory::findOrFail($data['product_category_id']);
-        $feedsNames = ['feeds', 'feed', 'hog feed', 'hog feeds'];
+        // Remove logic related to "starter" and "feed"
+        // Directly set base_unit based on category check without considering "starter" logic
+        $category = ProductCategory::findOrFail($data['product_category_id']);
+        $baseUnit = strtolower($category->name) === 'feed' ? 1 : 2; // Feed = 1 (sack), other = 2 (pieces)
 
-        // 1 = Sack, 2 = Piece
-        $baseUnit = in_array(strtolower($category->name), $feedsNames) ? 1 : 2;
+        // Set default reorder level: 10 sacks for feed, 20 pieces for non-feeds
+        $reorderLevel = $data['reorder_level'] ?? ($baseUnit === 1 ? 10 : 20);
+
+        // Set current stock if not provided
+        $currentStock = $data['current_stock'] ?? 0;
 
         $product = Product::create([
             'product_category_id' => $data['product_category_id'],
-            'brand_id'            => $data['brand_id'] ?? null,
-            'sku'                 => $data['sku'],
-            'name'                => $data['name'],
-            'base_unit'           => $baseUnit,
-            'cost_price'          => $data['cost_price'],
-            'selling_price'       => $data['selling_price'],
-            'current_stock'       => 0,
-            'reorder_level'       => 30,
-            'status'              => 'active',
+            'brand_id' => $data['brand_id'],
+            'sku' => $data['sku'],
+            'name' => $data['name'],
+            'base_unit' => $baseUnit,
+            'cost_price' => $data['cost_price'],
+            'selling_price' => $data['selling_price'],
+            'current_stock' => $currentStock,  // Will be 0 if not provided
+            'reorder_level' => $reorderLevel,  // Set default reorder level
+            'status' => 'active',
         ]);
 
-        return [
+        return response()->json([
+            'message' => 'Product created successfully.',
             'product' => $product->load(['category', 'brand']),
-        ];
+        ], 201);
     }
 
     public function show($id)
     {
-        $product = Product::with(['category', 'brand'])->findOrFail($id);
-
-        return ['product' => $product];
+        $product = Product::find($id); // or findOrFail($id)
+        if (!$product) {
+            return response()->json(['message' => 'Product not found'], 404);
+        }
+        return response()->json($product);
     }
 
+    /**
+     * PUT/PATCH /api/owner/products/{id}
+     *
+     * Update product.
+     */
     public function update(Request $request, $id)
     {
         $product = Product::findOrFail($id);
 
+        // Validate the request
         $data = $request->validate([
             'product_category_id' => ['sometimes', 'integer', 'exists:product_categories,id'],
-            'brand_id'            => ['sometimes', 'nullable', 'integer', 'exists:brands,id'],
-            'sku'                 => ['sometimes', 'nullable', 'max:100', Rule::unique('products')->ignore($id)->whereNull('deleted_at')],
-            'name'                => ['sometimes', 'string', 'max:255', Rule::unique('products')->ignore($id)->whereNull('deleted_at')],
-            'cost_price'          => ['sometimes', 'numeric'],
-            'selling_price'       => ['sometimes', 'numeric'],
-            'reorder_level'       => ['sometimes', 'integer'],
-            'status'              => ['sometimes', 'in:active,inactive'],
+            'brand_id' => ['sometimes', 'nullable', 'integer', 'exists:brands,id'],
+            'sku' => [
+                'sometimes',
+                'nullable',
+                'string',
+                'max:100',
+                Rule::unique('products')
+                    ->ignore($id)
+                    ->whereNull('deleted_at')
+                    ->where(function ($query) use ($request) {
+                        // Enforce uniqueness across the combination of name, brand, and sku
+                        $query->where('name', $request->name)
+                            ->where('brand_id', $request->brand_id)
+                            ->where('sku', $request->sku);
+                    }),
+            ],
+            'name' => [
+                'sometimes',
+                'string',
+                'max:255',
+                Rule::unique('products')
+                    ->ignore($id)
+                    ->whereNull('deleted_at')
+                    ->where(function ($query) use ($request) {
+                        // Enforce uniqueness across the combination of name, brand, and sku
+                        $query->where('name', $request->name)
+                            ->where('brand_id', $request->brand_id)
+                            ->where('sku', $request->sku);
+                    }),
+            ],
+            'cost_price' => ['sometimes', 'numeric', 'min:0'],
+            'selling_price' => ['sometimes', 'numeric', 'min:0'],
+            'current_stock' => ['nullable', 'numeric', 'min:0'],
+            'reorder_level' => ['nullable', 'numeric', 'min:0'],
+            'status' => ['sometimes', 'in:active,inactive'],
         ]);
 
         // If category changes, recompute base_unit
         if (isset($data['product_category_id'])) {
-            $category   = ProductCategory::findOrFail($data['product_category_id']);
-            $feedsNames = ['feeds', 'feed', 'hog feed', 'hog feeds'];
+            $category = ProductCategory::findOrFail($data['product_category_id']);
+            $baseUnit = strtolower($category->name) === 'feed' ? 1 : 2;
+            $data['base_unit'] = $baseUnit;
 
-            $data['base_unit'] = in_array(strtolower($category->name), $feedsNames) ? 1 : 2;
+            // Set default reorder level: 10 sacks for feed, 20 pieces for non-feeds
+            $data['reorder_level'] = $data['reorder_level'] ?? ($baseUnit === 1 ? 10 : 20);
         }
 
+        // Update the product with the validated data
         $product->update($data);
 
-        return [
+        // Return response
+        return response()->json([
+            'message' => 'Product updated successfully.',
             'product' => $product->fresh()->load(['category', 'brand']),
-        ];
+        ]);
     }
 
-public function destroy($id)
-{
-    // Use find() instead of findOrFail() to avoid throwing an exception
-    $product = Product::find($id);
+    /**
+     * DELETE /api/owner/products/{id}
+     *
+     * Soft or hard delete depending on your Product model.
+     */
+    public function destroy($id)
+    {
+        $product = Product::find($id);
 
-    // If product is already deleted or doesn't exist, we still return 200 OK.
-    if (! $product) {
+        // If product is already deleted or doesn't exist, still return 200 OK
+        if (!$product) {
+            return response()->json([
+                'message' => 'Product already deleted or not found.',
+            ], 200);
+        }
+
+        $product->delete();
+
         return response()->json([
-            'message' => 'Product already deleted or not found.',
+            'message' => 'Product deleted successfully.',
         ], 200);
     }
 
-    // Soft delete or hard delete depending on your model
-    $product->delete();
-
-    return response()->json([
-        'message' => 'Product deleted successfully.',
-    ], 200);
-}
-
-
+    /**
+     * GET /api/owner/products/{id}/batches
+     *
+     * Returns all batches for a product (for FEFO, expiry view, etc.).
+     */
     public function batches($id)
     {
         $product = Product::findOrFail($id);
@@ -135,6 +244,9 @@ public function destroy($id)
             ->orderBy('expiry_date')
             ->get();
 
-        return response()->json($batches);
+        return response()->json([
+            'product_id' => $product->id,
+            'batches' => $batches,
+        ]);
     }
 }

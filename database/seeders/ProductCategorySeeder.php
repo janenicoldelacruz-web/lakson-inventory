@@ -13,7 +13,7 @@ class ProductCategorySeeder extends Seeder
             ['id' => 1, 'name' => 'Feeds'],
             ['id' => 2, 'name' => 'Vitamins'],
             ['id' => 3, 'name' => 'Supplements'],
-            ['id' => 4, 'name' => 'Medicine'],
+            ['id' => 4, 'name' => 'Medicines'],
         ]);
     }
 }

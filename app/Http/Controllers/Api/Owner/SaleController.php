@@ -13,18 +13,13 @@ use Illuminate\Support\Facades\DB;
 
 class SaleController extends Controller
 {
-    /**
-     * GET /api/owner/sales
-     * Optional filters:
-     *  - from (date)
-     *  - to   (date)
-     *  - sale_type (walk_in, online)
-     */
+    // Fetch sales list with pagination and filters
     public function index(Request $request)
     {
-        $query = Sale::with('items.product')
-            ->orderByDesc('sale_date');
+        $query = Sale::with('items.product') // Eager load sale items and their products
+            ->orderByRaw('sale_date IS NULL, sale_date ASC'); // Default order by sale date ascending
 
+        // Apply filters if provided
         if ($request->filled('from')) {
             $query->whereDate('sale_date', '>=', $request->input('from'));
         }
@@ -37,47 +32,17 @@ class SaleController extends Controller
             $query->where('sale_type', $saleType);
         }
 
+        // Pagination: default to 15 items per page
         $perPage = (int) $request->get('per_page', 15);
-        $sales   = $query->paginate($perPage);
+        $sales = $query->paginate($perPage);
 
         return response()->json($sales);
     }
 
-    /**
-     * GET /api/owner/sales/{id}
-     */
-    public function show($id)
-    {
-        $sale = Sale::with(['items.product', 'items.batch'])
-            ->findOrFail($id);
-
-        return response()->json([
-            'sale' => $sale,
-        ]);
-    }
-
-    /**
-     * POST /api/owner/sales
-     *
-     * Expects:
-     * {
-     *   "sale_date": "2025-11-24",
-     *   "sale_type": "walk_in",
-     *   "customer_name": "Juan Dela Cruz",
-     *   "customer_contact": "09123456789",
-     *   "items": [
-     *     {
-     *       "product_id": 1,
-     *       "quantity": 2,
-     *       "unit_price": 1700
-     *     }
-     *   ]
-     * }
-     *
-     * Stock-out comes ONLY from here (FEFO).
-     */
+    // Store a new sale and update stock
     public function store(Request $request)
     {
+        // Validate request data
         $data = $request->validate([
             'sale_date'        => ['required', 'date'],
             'sale_type'        => ['required', 'in:walk_in,online'],
@@ -89,97 +54,131 @@ class SaleController extends Controller
             'items.*.unit_price' => ['required', 'numeric', 'min:0'],
         ]);
 
-        $sale = DB::transaction(function () use ($data) {
-            $sale = Sale::create([
-                'sale_date'        => $data['sale_date'],
-                'sale_type'        => $data['sale_type'],
-                'customer_name'    => $data['customer_name'] ?? null,
-                'customer_contact' => $data['customer_contact'] ?? null,
-                'status'           => 'completed',
-                'total_amount'     => 0,
-            ]);
+        try {
+            $sale = DB::transaction(function () use ($data) {
+                // Create the sale
+                $sale = Sale::create([
+                    'sale_date'        => $data['sale_date'],
+                    'sale_type'        => $data['sale_type'],
+                    'customer_name'    => $data['customer_name'] ?? null,
+                    'customer_contact' => $data['customer_contact'] ?? null,
+                    'status'           => 'completed',
+                    'total_amount'     => 0,
+                ]);
 
-            $totalAmount = 0;
+                $totalAmount = 0;
 
-            foreach ($data['items'] as $itemData) {
-                $product = Product::findOrFail($itemData['product_id']);
-                $displayQty = (float) $itemData['quantity'];
-                $unitPrice  = (float) $itemData['unit_price'];
+                // Process each item in the sale
+                foreach ($data['items'] as $itemData) {
+                    $product = Product::findOrFail($itemData['product_id']);
+                    $displayQty = (float) $itemData['quantity'];
+                    $unitPrice  = (float) $itemData['unit_price'];
 
-                // FEFO allocation across batches
-                $allocations = $this->deductFromBatchesFefo($product, $displayQty);
+                    // Ensure unit_price matches the product's brand price
+                    $unitPrice = $this->getUnitPriceBasedOnBrand($product, $unitPrice);
 
-                // Approximate unit cost at sale (e.g., from average purchase cost)
-                $unitCostAtSale = $this->getAverageUnitCost($product);
-
-                foreach ($allocations as $alloc) {
-                    $batch      = $alloc['batch'];
-                    $allocDisp  = $alloc['display_qty'];
-                    $allocStore = $alloc['stored_qty'];
-
-                    $lineTotal = $allocDisp * $unitPrice;
-                    $lineCost  = $allocDisp * $unitCostAtSale;
-
-                    // Create sale item
-                    $saleItem = SaleItem::create([
-                        'sale_id'          => $sale->id,
-                        'product_id'       => $product->id,
-                        'batch_id'         => $batch ? $batch->id : null,
-                        'quantity'         => $allocDisp,
-                        'unit_price'       => $unitPrice,
-                        'line_total'       => $lineTotal,
-                        'unit_cost_at_sale'=> $unitCostAtSale,
-                        'line_cost'        => $lineCost,
-                    ]);
-
-                    // Update batch qty
-                    if ($batch) {
-                        $batch->decrement('quantity', $allocStore);
+                    // Check stock before proceeding
+                    $availableStock = $this->getAvailableStock($product);
+                    if ($availableStock < $displayQty) {
+                        throw new \RuntimeException("Insufficient stock for product '{$product->name}'. Available stock: {$availableStock}");
                     }
 
-                    // Update product stock
-                    $product->decrement('current_stock', $allocStore);
+                    // FEFO allocation across batches
+                    $allocations = $this->deductFromBatchesFefo($product, $displayQty);
 
-                    // Stock movement
-                    StockMovement::create([
-                        'product_id'      => $product->id,
-                        'batch_id'        => $batch ? $batch->id : null,
-                        'movement_type'   => 'sale',
-                        'reference_type'  => 'sale_item',
-                        'reference_id'    => $saleItem->id,
-                        'quantity_change' => -$allocStore,
-                        'remarks'         => 'Sale stock-out',
-                    ]);
+                    // Approximate unit cost at sale (e.g., from average purchase cost)
+                    $unitCostAtSale = $this->getAverageUnitCost($product);
 
-                    $totalAmount += $lineTotal;
+                    // Process each allocation from batches
+                    foreach ($allocations as $alloc) {
+                        $batch      = $alloc['batch'];
+                        $allocDisp  = $alloc['display_qty'];
+                        $allocStore = $alloc['stored_qty'];
+
+                        $lineTotal = $allocDisp * $unitPrice;
+                        $lineCost  = $allocDisp * $unitCostAtSale;
+
+                        // Create sale item
+                        $saleItem = SaleItem::create([
+                            'sale_id'          => $sale->id,
+                            'product_id'       => $product->id,
+                            'batch_id'         => $batch ? $batch->id : null,
+                            'quantity'         => $allocDisp,
+                            'unit_price'       => $unitPrice,
+                            'line_total'       => $lineTotal,
+                            'unit_cost_at_sale' => $unitCostAtSale,
+                            'line_cost'        => $lineCost,
+                        ]);
+
+                        // Update batch quantity
+                        if ($batch) {
+                            $batch->decrement('quantity', $allocStore);
+                        }
+
+                        // Update product stock
+                        $product->decrement('current_stock', $allocStore);
+
+                        // Stock movement
+                        StockMovement::create([
+                            'product_id'      => $product->id,
+                            'batch_id'        => $batch ? $batch->id : null,
+                            'movement_type'   => 'sale',
+                            'reference_type'  => 'sale_item',
+                            'reference_id'    => $saleItem->id,
+                            'quantity_change' => -$allocStore,
+                            'remarks'         => 'Sale stock-out',
+                        ]);
+
+                        // Add to total amount
+                        $totalAmount += $lineTotal;
+                    }
                 }
-            }
 
-            $sale->update([
-                'total_amount' => $totalAmount,
-            ]);
+                // Update total amount of the sale
+                $sale->update([
+                    'total_amount' => $totalAmount,
+                ]);
 
-            return $sale;
-        });
+                return $sale;
+            });
 
-        return response()->json([
-            'message' => 'Sale created successfully.',
-            'sale'    => $sale->load('items.product', 'items.batch'),
-        ], 201);
+            return response()->json([
+                'message' => 'Sale created successfully.',
+                'sale'    => $sale->load('items.product', 'items.batch'),
+            ], 201);
+        } catch (\Exception $e) {
+            return response()->json([
+                'message' => 'Sale creation failed.',
+                'error' => $e->getMessage(),
+            ], 400);
+        }
     }
 
-    /**
-     * FEFO: allocate stock from earliest-expiry batches.
-     * Returns an array of:
-     *  [
-     *    [
-     *      'batch'       => ProductBatch|null,
-     *      'display_qty' => float,
-     *      'stored_qty'  => float,
-     *    ],
-     *    ...
-     *  ]
-     */
+    // Get available stock based on product category and stock type
+    // Get available stock based on product category and stock type
+protected function getAvailableStock(Product $product)
+{
+    $availableStock = 0;
+
+    // For feed-related categories (Pre Starter Feed, Other Feed), assume 1 sack = 50kg
+    if ($product->category->name == 'Pre Starter Feed' || $product->category->name == 'Other Feed') {
+        $availableStock = floor($product->current_stock / 50); // 1 sack = 50kg
+    } else {
+        // For other categories (e.g., pieces like vitamins/medicines), count by individual pieces
+        $availableStock = $product->current_stock;
+    }
+
+    return $availableStock;
+}
+
+
+    // Ensure unit price matches the product's brand price
+    protected function getUnitPriceBasedOnBrand(Product $product, $unitPrice)
+    {
+        return $product->brand ? ($unitPrice ?: $product->selling_price) : $unitPrice;
+    }
+
+    // Allocate stock based on earliest-expiry batches (FEFO)
     protected function deductFromBatchesFefo(Product $product, float $displayQuantity): array
     {
         $remainingDisplay = $displayQuantity;
@@ -197,7 +196,6 @@ class SaleController extends Controller
                 break;
             }
 
-            // Convert batch quantity (stored) back to display units for comparison
             $batchDisplayQty = $this->convertToDisplayQuantity($product, (float) $batch->quantity);
 
             if ($batchDisplayQty <= 0) {
@@ -217,7 +215,6 @@ class SaleController extends Controller
         }
 
         if ($remainingDisplay > 0) {
-            // Not enough stock; you can throw exception or handle differently
             throw new \RuntimeException('Not enough stock to fulfill sale for product ID ' . $product->id);
         }
 
@@ -226,30 +223,18 @@ class SaleController extends Controller
 
     protected function convertToStoredQuantity(Product $product, float $displayQuantity): float
     {
-        if ((int) $product->base_unit === 1) {
-            return $displayQuantity * 25;
-        }
-
-        return $displayQuantity;
+        return (int) $product->base_unit === 1 ? $displayQuantity * 25 : $displayQuantity;
     }
 
     protected function convertToDisplayQuantity(Product $product, float $storedQuantity): float
     {
-        if ((int) $product->base_unit === 1) {
-            return $storedQuantity / 25;
-        }
-
-        return $storedQuantity;
+        return (int) $product->base_unit === 1 ? $storedQuantity / 25 : $storedQuantity;
     }
 
-    /**
-     * Approximate unit cost at sale time
-     * using average purchase unit_cost for this product.
-     */
+    // Approximate unit cost at sale time using average purchase cost for the product
     protected function getAverageUnitCost(Product $product): float
     {
         $avg = $product->purchaseItems()->avg('unit_cost');
-
         return $avg !== null ? (float) $avg : 0.0;
     }
 }
