@@ -3,21 +3,20 @@
 namespace App\Providers;
 
 use Illuminate\Support\ServiceProvider;
+use Illuminate\Support\Facades\Route;
+use App\Http\Middleware\CorsMiddleware;
 
 class AppServiceProvider extends ServiceProvider
 {
-    /**
-     * Register any application services.
-     */
-    public function register(): void
+    public function boot()
     {
-        //
+        // Register CorsMiddleware globally for web and api routes
+        Route::middleware([CorsMiddleware::class])->group(function () {
+            // Any route added here will automatically have the CORS middleware applied.
+        });
     }
 
-    /**
-     * Bootstrap any application services.
-     */
-    public function boot(): void
+    public function register()
     {
         //
     }

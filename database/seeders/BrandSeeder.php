@@ -21,7 +21,7 @@ class BrandSeeder extends Seeder
                 'Purina',
                 'Robina',
                 'Pilmico',
-                'Universal Feeds',
+                'Gold Label Feeds',
             ],
 
             // Supplements for pigs
