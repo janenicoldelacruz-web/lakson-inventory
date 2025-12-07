@@ -2,13 +2,12 @@
 
 namespace App\Models;
 
-use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
 
 class AuditLog extends Model
 {
-    use HasFactory, SoftDeletes;
+    use SoftDeletes;
 
     protected $fillable = [
         'user_id',
@@ -16,16 +15,13 @@ class AuditLog extends Model
         'entity_type',
         'entity_id',
         'changes',
+        'meta',
         'ip_address',
         'user_agent',
     ];
 
     protected $casts = [
         'changes' => 'array',
+        'meta'    => 'array',
     ];
-
-    public function user()
-    {
-        return $this->belongsTo(User::class, 'user_id');
-    }
 }

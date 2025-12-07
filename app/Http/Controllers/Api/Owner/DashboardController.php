@@ -10,8 +10,8 @@ use App\Models\Product;
 use App\Models\ProductBatch;
 use App\Models\ProductCategory;
 use Illuminate\Support\Carbon;
-use App\Events\DashboardUpdated;
 use Illuminate\Support\Facades\DB;
+use App\Events\DashboardUpdated;
 
 class DashboardController extends Controller
 {
@@ -20,7 +20,6 @@ class DashboardController extends Controller
         $startOfMonth = now()->startOfMonth();
         $endOfMonth   = now()->endOfMonth();
 
-        // ---------------- REVENUE / PURCHASES / PROFIT ----------------
         $revenue = Sale::whereBetween('sale_date', [$startOfMonth, $endOfMonth])
             ->where('status', 'completed')
             ->sum('total_amount');
@@ -34,378 +33,387 @@ class DashboardController extends Controller
             ->sum('sale_items.line_cost');
 
         $profit = $revenue - $cogs;
+        $totalProducts = Product::where('status', 'active')->count();
 
-        // ---------------- MONTHLY SALES (CURRENT YEAR) ----------------
-        $monthlySales = Sale::selectRaw('MONTH(sale_date) as month, SUM(total_amount) as total')
-            ->whereYear('sale_date', now()->year)
-            ->where('status', 'completed')
-            ->groupBy('month')
-            ->orderBy('month')
-            ->get();
+        $monthlySales = $this->getMonthlySales(6);
+        $stockForecast = $this->getStockForecast($monthlySales, 6, 3);
+        $lowStock = $this->getLowStockProducts();
+        $expiringSoon = $this->getExpiringSoon();
+        $categoryInventory = $this->getCategoryInventory();
+        $topProducts = $this->getTopProducts();
 
-        // ---------------- LOW STOCK ----------------
-$lowStock = Product::where('status', 'active')
-    ->whereNotNull('reorder_level')
-    ->whereColumn('current_stock', '<=', 'reorder_level')   // ✅ strict rule
-    ->orderBy('current_stock')
-    ->get([
-        'id',
-        'sku',
-        'name',
-        'current_stock',
-        'reorder_level',
-        'base_unit',
-    ])
-    ->map(function ($product) {
-        $baseUnitCode = $product->base_unit;
-        $current      = (float) $product->current_stock;
-        $reorder      = (float) ($product->reorder_level ?? 0);
+        $peakSeasonRecommendations = $this->getPeakSeasonProducts(
+            now()->subYear()->startOfYear(),
+            now()->subYear()->endOfYear()
+        );
 
-        // Map numeric base_unit → logical unit
-        $baseUnit = 'kg';
-        if ($baseUnitCode === 2 || $baseUnitCode === '2') {
-            $baseUnit = 'pcs';
+        $payload = [
+            'revenue'        => $revenue,
+            'purchases'      => $purchases,
+            'profit'         => $profit,
+            'total_products' => $totalProducts,
+            'monthly_sales'  => $monthlySales,
+            'stock_forecast' => $stockForecast,
+            'inventory_by_category' => $categoryInventory,
+            'top_products'   => $topProducts,
+            'low_stock'      => $lowStock,
+            'expiring_soon'  => $expiringSoon,
+            'peak_season_recommendations' => $peakSeasonRecommendations,
+        ];
+
+        broadcast(new DashboardUpdated($payload));
+        return response()->json($payload);
+    }
+
+    protected function formatQuantityForProduct(float $qty, ?Product $product): string
+{
+    if ($qty <= 0) {
+        return '0';
+    }
+
+    // Handle numeric codes from DB: 1 = kg, 2 = pcs
+    $rawUnit = $product->base_unit ?? 1;
+
+    if ($rawUnit === 2 || $rawUnit === '2') {
+        $unit = 'pcs';
+    } elseif ($rawUnit === 1 || $rawUnit === '1') {
+        $unit = 'kg';
+    } else {
+        // If already stored as text (just in case)
+        $unit = strtolower((string) $rawUnit);
+    }
+
+    // Pieces
+    if (in_array($unit, ['pcs', 'piece', 'pieces', 'pc'], true)) {
+        return $this->fmt($qty) . ' pcs';
+    }
+
+    // Feeds in kg -> convert to sacks (all feeds = 50kg per sack)
+    if ($unit === 'kg') {
+        $packSize = 50;
+
+        $sacks = intdiv((int) floor($qty), $packSize);
+        $remainingKg = $qty - ($sacks * $packSize);
+
+        $parts = [];
+
+        if ($sacks > 0) {
+            $parts[] = $sacks . ' ' . ($sacks === 1 ? 'sack' : 'sacks');
         }
 
-        // Decide sack size for feeds
-        $getPackSizeKg = function () use ($product, $baseUnit) {
-            if ($baseUnit !== 'kg') {
-                return null;
-            }
+        if ($remainingKg > 0) {
+            $parts[] = $this->fmt($remainingKg) . ' kg';
+        }
 
-            $name = strtolower($product->name ?? '');
-            return str_contains($name, 'prestarter') ? 25 : 50; // starter=25kg, others=50kg
-        };
+        if (empty($parts)) {
+            return $this->fmt($qty) . ' kg';
+        }
 
-        $packSizeKg = $getPackSizeKg();
+        return implode(' + ', $parts) . ' (' . $this->fmt($qty) . ' kg)';
+    }
 
-        $formatQty = function (float $qty) use ($baseUnit, $packSizeKg) {
-            // pcs
-            if ($baseUnit === 'pcs') {
-                $qtyFmt = rtrim(rtrim(number_format($qty, 2, '.', ''), '0'), '.');
-                return "{$qtyFmt} pcs";
-            }
-
-            // feeds in kg
-            if ($baseUnit === 'kg' && $packSizeKg) {
-                if ($qty <= 0) {
-                    return '0 sacks (0 kg)';
-                }
-
-                $kgFmt = rtrim(rtrim(number_format($qty, 2, '.', ''), '0'), '.');
-
-                // if less than 1 full sack → show only kg
-                if ($qty < $packSizeKg) {
-                    return "{$kgFmt} kg";
-                }
-
-                $sacks    = $qty / $packSizeKg;
-                $sacksFmt = rtrim(rtrim(number_format($sacks, 2, '.', ''), '0'), '.');
-                $label    = ((float) $sacksFmt === 1.0) ? 'sack' : 'sacks';
-
-                return "{$sacksFmt} {$label} ({$kgFmt} kg)";
-            }
-
-            // fallback
-            $qtyFmt = rtrim(rtrim(number_format($qty, 2, '.', ''), '0'), '.');
-            return "{$qtyFmt} {$baseUnit}";
-        };
-
-        return [
-            'id'              => $product->id,
-            'sku'             => $product->sku,
-            'name'            => $product->name,
-            'current_stock'   => $current,
-            'reorder_level'   => $reorder,
-            'base_unit'       => $product->base_unit,
-            'current_display' => $formatQty($current),
-            'reorder_display' => $reorder > 0 ? $formatQty($reorder) : null,
-        ];
-    });
+    // Fallback for any other unit
+    return $this->fmt($qty) . " {$unit}";
+}
 
 
-        // ---------------- EXPIRING SOON (NEXT 30 DAYS) ----------------
-        $expiringSoon = ProductBatch::with(['product:id,sku,name,base_unit'])
+    protected function fmt(float $v): string
+    {
+        return rtrim(rtrim(number_format($v, 2, '.', ''), '0'), '.');
+    }
+
+    protected function getLowStockProducts()
+    {
+        return Product::where('status', 'active')
+            ->whereNotNull('reorder_level')
+            ->whereColumn('current_stock', '<=', 'reorder_level')
+            ->orderBy('current_stock')
+            ->get()
+            ->map(function ($p) {
+                return [
+                    'id'              => $p->id,
+                    'sku'             => $p->sku,
+                    'name'            => $p->name,
+                    'base_unit'       => $p->base_unit,
+                    'current_stock'   => $p->current_stock,
+                    'reorder_level'   => $p->reorder_level,
+                    'current_display' => $this->formatQuantityForProduct($p->current_stock, $p),
+                    'reorder_display' => $this->formatQuantityForProduct($p->reorder_level, $p),
+                ];
+            });
+    }
+
+    protected function getExpiringSoon()
+    {
+        return ProductBatch::with(['product:id,name,base_unit'])
             ->whereDate('expiry_date', '>=', now())
             ->whereDate('expiry_date', '<=', now()->addDays(30))
             ->orderBy('expiry_date')
-            ->get([
-                'id',
-                'product_id',
-                'batch_code',
-                'expiry_date',
-                'quantity',
-            ])
-            ->map(function (ProductBatch $batch) {
-                $product  = $batch->product;
-                $qty      = (float) $batch->quantity;
-                $daysLeft = now()->diffInDays(Carbon::parse($batch->expiry_date), false);
-
+            ->get()
+            ->map(function ($b) {
                 return [
-                    'id'               => $batch->id,
-                    'product_id'       => $batch->product_id,
-                    'sku'              => $product->sku ?? null,
-                    'product_name'     => $product->name ?? null,
-                    'batch_code'       => $batch->batch_code,
-                    'expiry_date'      => $batch->expiry_date,
-                    'quantity_raw'     => $qty,
-                    'quantity_display' => $this->formatQuantityForProduct($qty, $product),
-                    'base_unit'        => $product->base_unit ?? null,
-                    'days_left'        => (int) $daysLeft,
+                    'id'               => $b->id,
+                    'batch_code'       => $b->batch_code,
+                    'product_id'       => $b->product_id,
+                    'product_name'     => $b->product->name,
+                    'expiry_date'      => $b->expiry_date,
+                    'quantity_raw'     => $b->quantity,
+                    'quantity_display' => $this->formatQuantityForProduct($b->quantity, $b->product),
+                    'days_left'        => now()->diffInDays($b->expiry_date),
                 ];
             });
+    }
 
-
-        // ---------------- SEASONAL DATA / PEAK SEASON ----------------
-        $seasonStart = now()->copy()->subYear();
-        $seasonEnd   = now();
-
-        $seasonalData = SaleItem::query()
-            ->selectRaw('sale_items.product_id, MONTH(sales.sale_date) as month, SUM(sale_items.quantity) as total_qty')
-            ->leftJoin('sales', 'sale_items.sale_id', '=', 'sales.id')
-            ->where('sales.status', 'completed')
-            ->whereBetween('sales.sale_date', [$seasonStart, $seasonEnd])
-            ->groupBy('sale_items.product_id', 'month')
-            ->get();
-
-        $productIds = $seasonalData->pluck('product_id')->unique()->all();
-
-        $products = Product::whereIn('id', $productIds)
-            ->get(['id', 'name', 'current_stock', 'reorder_level', 'base_unit', 'status'])
-            ->keyBy('id');
-
-        $peakSeasonRecommendations = [];
-        $bufferDays   = 30;
-        $safetyFactor = 1.2;
-        $grouped      = $seasonalData->groupBy('product_id');
-
-        foreach ($grouped as $productId => $rows) {
-            /** @var Product|null $product */
-            $product = $products->get($productId);
-            if (! $product || $product->status !== 'active') {
-                continue;
-            }
-
-            $peakRow = $rows->sortByDesc('total_qty')->first();
-            if (! $peakRow || $peakRow->total_qty <= 0) {
-                continue;
-            }
-
-            $peakMonth     = (int) $peakRow->month;
-            $peakMonthName = Carbon::create()->month($peakMonth)->format('F');
-
-            $peakQty       = (float) $peakRow->total_qty;
-            $avgMonthlyQty = (float) $rows->avg('total_qty');
-
-            $now         = now();
-            $currentYear = $now->year;
-
-            $peakThisYear = Carbon::create($currentYear, $peakMonth, 1)->startOfDay();
-            $peakNextYear = Carbon::create($currentYear + 1, $peakMonth, 1)->startOfDay();
-            $upcomingPeak = $peakThisYear->lessThan($now) ? $peakNextYear : $peakThisYear;
-
-            $windowStart = $upcomingPeak->copy()->subDays($bufferDays);
-            $isNearPeak  = $now->between($windowStart, $upcomingPeak);
-
-            $targetStock  = $peakQty * $safetyFactor;
-            $currentStock = (float) $product->current_stock;
-
-            $shouldRestock         = false;
-            $recommendedAdditional = 0.0;
-
-            if ($isNearPeak && $currentStock < $targetStock) {
-                $shouldRestock         = true;
-                $recommendedAdditional = max(0, $targetStock - $currentStock);
-            }
-
-            $peakSeasonRecommendations[] = [
-                'product_id'                 => $product->id,
-                'product_name'               => $product->name,
-                'current_stock'              => $currentStock,
-                'current_stock_display'      => $this->formatQuantityForProduct($currentStock, $product),
-                'reorder_level'              => (float) $product->reorder_level,
-                'reorder_level_display'      => $this->formatQuantityForProduct((float) $product->reorder_level, $product),
-                'base_unit'                  => $product->base_unit,
-                'peak_month'                 => $peakMonth,
-                'peak_month_name'            => $peakMonthName,
-                'last_peak_quantity'         => $peakQty,
-                'last_peak_quantity_display' => $this->formatQuantityForProduct($peakQty, $product),
-                'avg_monthly_quantity'       => $avgMonthlyQty,
-                'avg_monthly_quantity_display' => $this->formatQuantityForProduct($avgMonthlyQty, $product),
-                'upcoming_peak_date'         => $upcomingPeak->toDateString(),
-                'near_peak_window_start'     => $windowStart->toDateString(),
-                'is_near_peak'               => $isNearPeak,
-                'target_stock_for_peak'      => $targetStock,
-                'target_stock_for_peak_display' => $this->formatQuantityForProduct($targetStock, $product),
-                'should_restock'             => $shouldRestock,
-                'recommended_additional_qty' => $recommendedAdditional,
-                'recommended_additional_qty_display' => $this->formatQuantityForProduct($recommendedAdditional, $product),
-            ];
-        }
-
-        // ---------------- INVENTORY BY CATEGORY ----------------
-       // ---------------- INVENTORY BY CATEGORY (SACKS + PCS) ----------------
-$productInventoryByCategory = ProductCategory::with(['products' => function ($q) {
-        $q->where('status', 'active');
-    }])
-    ->get()
-    ->map(function ($category) {
-        $totalKg   = 0.0;  // total weight in kg (feeds)
-        $totalSacks = 0.0; // total sacks (25kg or 50kg depending on product)
-        $totalPcs  = 0.0;  // total pieces (vitamins, etc.)
-
-        foreach ($category->products as $product) {
-            $qty = (float) $product->current_stock;
-            if ($qty <= 0) {
-                continue;
-            }
-
-            $baseUnit = strtolower((string) ($product->base_unit ?? ''));
-
-            // Treat base_unit "2" or pcs as pieces
-            if (in_array($baseUnit, ['2', 'pcs', 'piece', 'pieces', 'pc'], true)) {
-                $totalPcs += $qty;
-                continue;
-            }
-
-            // Treat base_unit "1" or kg as kilograms (feeds)
-            if (in_array($baseUnit, ['1', 'kg', 'kilo', 'kilogram', 'kilograms', ''], true)) {
-                $totalKg += $qty;
-
-                $name     = strtolower($product->name ?? '');
-                // Starter feeds = 25 kg per sack, others = 50 kg per sack
-                $packSize = str_contains($name, 'prestarter') ? 25 : 50;
-
-                if ($packSize > 0) {
-                    $totalSacks += $qty / $packSize;
-                }
-            }
-        }
-
-        // Display string for tooltip / UI
-        $trim = function (float $v): string {
-            return rtrim(rtrim(number_format($v, 2, '.', ''), '0'), '.');
-        };
-
-        if ($totalSacks > 0) {
-            $display = $trim($totalSacks) . ' sacks (' . $trim($totalKg) . ' kg)';
-        } elseif ($totalPcs > 0) {
-            $display = $trim($totalPcs) . ' pcs';
-        } else {
-            $display = '0';
-        }
-
-        return [
-            'category_id'         => $category->id,
-            'category_name'       => $category->name,
-            'total_sacks'         => $totalSacks,   // for feeds categories
-            'total_stock_kg'      => $totalKg,      // feeds weight
-            'total_stock_pcs'     => $totalPcs,     // vitamins/supplements/etc.
-            'total_stock_display' => $display,      // e.g. "37 sacks (1100 kg)"
-        ];
-    });
-
-// Count only categories that actually have stock
-$productCategoryCount = $productInventoryByCategory
-    ->filter(function ($row) {
-        return ($row['total_sacks'] ?? 0) > 0 || ($row['total_stock_pcs'] ?? 0) > 0;
-    })
-    ->count();
-
-        // ---------------- TOP PRODUCTS (CURRENT MONTH) ----------------
-        $topProducts = SaleItem::query()
-            ->selectRaw('sale_items.product_id, products.name as product_name, SUM(sale_items.quantity) as total_qty')
-            ->leftJoin('sales', 'sale_items.sale_id', '=', 'sales.id')
-            ->leftJoin('products', 'sale_items.product_id', '=', 'products.id')
-            ->where('sales.status', 'completed')
-            ->whereBetween('sales.sale_date', [$startOfMonth, $endOfMonth])
-            ->groupBy('sale_items.product_id', 'products.name')
-            ->orderByDesc('total_qty')
-            ->limit(5)
+    protected function getCategoryInventory()
+    {
+        return ProductCategory::with(['products'])
             ->get()
-            ->map(function ($row) use ($products) {
-                /** @var Product|null $product */
-                $product = $products->get($row->product_id);
-                $qty     = (float) $row->total_qty;
+            ->map(function ($cat) {
+                $kg = 0; $pcs = 0;
+                foreach ($cat->products as $p) {
+                    if ($p->base_unit === 'kg') $kg += $p->current_stock;
+                    else $pcs += $p->current_stock;
+                }
 
-                $row->total_qty_display = $product
-                    ? $this->formatQuantityForProduct($qty, $product)
-                    : $qty;
-
-                return $row;
+                return [
+                    'category_id'   => $cat->id,
+                    'category_name' => $cat->name,
+                    'total_stock_kg' => $kg,
+                    'total_stock_sacks' => $kg > 0 ? round($kg / 50, 2) : 0,
+                    'total_stock_pcs' => $pcs,
+                    'total_stock_display' => $kg > 0 
+                        ? round($kg / 50, 2) . " sacks ({$kg} kg)"
+                        : $pcs . " pcs",
+                ];
             });
-
-        // ---------------- RESPONSE PAYLOAD ----------------
-        $dashboardData = [
-            'revenue'                       => $revenue,
-            'purchases'                     => $purchases,
-            'profit'                        => $profit,
-            'monthly_sales'                 => $monthlySales,
-            'low_stock'                     => $lowStock,
-            'expiring_soon'                 => $expiringSoon,
-            'peak_season_recommendations'   => $peakSeasonRecommendations,
-            'product_inventory_by_category' => $productInventoryByCategory,
-            'product_category_count'        => $productCategoryCount,
-            'top_products'                  => $topProducts,
-        ];
-
-        broadcast(new DashboardUpdated($dashboardData));
-
-        return response()->json($dashboardData);
     }
 
     /**
-     * Format a quantity for a given product:
-     * - Feeds (base_unit = kg): "X sacks (Y kg)" using 25kg for "starter", 50kg for others
-     * - Pieces: "N pcs"
-     * - Fallback: "N unit"
-     */
-   /**
- * Format a quantity for a given product:
- * - Feeds (base_unit = kg): "1 sack (25 kg)" / "5 sacks (250 kg)"
- * - Pieces: "N pcs"
- * - Fallback: "N unit"
+ * Top-selling product in each category.
+ * Result is still a flat list used by TopProductsChart.
+ * Example item:
+ * {
+ *   product_id: 1,
+ *   product_name: "Pre Starter",
+ *   category_id: 2,
+ *   category_name: "Feeds",
+ *   total_qty: 151,
+ *   display_qty: "3 sacks + 1 kg (151 kg)"
+ * }
  */
-protected function formatQuantityForProduct(float $qty, ?Product $product): string
+/**
+ * Top-selling product in each category (safe version).
+ */
+protected function getTopProducts()
 {
-    $baseUnit = strtolower($product->base_unit ?? 'kg');
+    // 1) Aggregate total sold per product (kg / pcs)
+    $rows = SaleItem::selectRaw('
+            sale_items.product_id,
+            SUM(sale_items.quantity) AS total_qty
+        ')
+        ->leftJoin('sales', 'sale_items.sale_id', '=', 'sales.id')
+        ->where('sales.status', 'completed')
+        ->groupBy('sale_items.product_id')
+        ->get();
 
-    // Pieces / vitamins etc.
-    if (in_array($baseUnit, ['pcs', 'piece', 'pieces', 'pc'])) {
-        $qtyFmt = $this->fmt($qty);
-        return "{$qtyFmt} pcs";
+    if ($rows->isEmpty()) {
+        return [];
     }
 
-    // Feeds in kg -> compute sacks
-    if ($baseUnit === 'kg') {
-        $name = strtolower($product->name ?? '');
+    // 2) Load products with category
+    $products = Product::with('category')
+        ->whereIn('id', $rows->pluck('product_id')->unique())
+        ->get()
+        ->keyBy('id');
 
-        // Starter → 25kg sacks, others → 50kg
-        $packSizeKg = str_contains($name, 'prestarter') ? 25 : 50;
+    // 3) Build top-1-per-category in PHP
+    $perCategory = []; // [category_id => ['row' => ..., 'product' => ...]]
 
-        if ($qty <= 0 || $packSizeKg <= 0) {
-            return '0 sacks (0 kg)';
+    foreach ($rows as $row) {
+        $product = $products->get($row->product_id);
+        if (! $product) {
+            continue;
         }
 
-        $sacks   = $qty / $packSizeKg;
-        $sacksFmt = $this->fmt($sacks);
-        $kgFmt    = $this->fmt($qty);
+        // Skip products without category
+        if (! $product->category) {
+            continue;
+        }
 
-        // singular / plural
-        $sackLabel = ((float) $sacksFmt == 1.0) ? 'sack' : 'sacks';
+        $catId   = $product->category->id;
+        $catName = $product->category->name;
+        $qty     = (float) $row->total_qty;
 
-        return "{$sacksFmt} {$sackLabel} ({$kgFmt} kg)";
+        // If category not seen yet OR this product has higher qty → replace
+        if (! isset($perCategory[$catId]) || $qty > $perCategory[$catId]['row']->total_qty) {
+            $perCategory[$catId] = [
+                'row'     => $row,
+                'product' => $product,
+                'cat_id'  => $catId,
+                'cat_name'=> $catName,
+            ];
+        }
     }
 
-    // Fallback – just show value + base unit
-    $qtyFmt = $this->fmt($qty);
-    return "{$qtyFmt} {$baseUnit}";
+    if (empty($perCategory)) {
+        return [];
+    }
+
+    // 4) Map to final structure
+    $result = [];
+
+    foreach ($perCategory as $catId => $bundle) {
+        $row     = $bundle['row'];
+        $product = $bundle['product'];
+        $qtyKg   = (float) $row->total_qty;
+
+        $result[] = [
+            'product_id'    => $product->id,
+            'product_name'  => $product->name,
+            'category_id'   => $bundle['cat_id'],
+            'category_name' => $bundle['cat_name'],
+            'total_qty'     => $qtyKg,
+            'display_qty'   => $this->formatQuantityForProduct($qtyKg, $product),
+        ];
+    }
+
+    // Sort by quantity desc for nicer chart ordering
+    usort($result, fn ($a, $b) => $b['total_qty'] <=> $a['total_qty']);
+
+    return $result;
 }
 
-protected function fmt(float $value): string
-{
-    // 25, 250 → no decimals; 12.5 → "12.5"
-    return rtrim(rtrim(number_format($value, 2, '.', ''), '0'), '.');
-}
 
+
+
+    protected function getPeakSeasonProducts($start, $end)
+    {
+        $data = SaleItem::selectRaw("
+                sale_items.product_id,
+                MONTH(sales.sale_date) as month,
+                SUM(sale_items.quantity) as total_qty
+            ")
+            ->leftJoin('sales', 'sale_items.sale_id', '=', 'sales.id')
+            ->whereBetween('sale_date', [$start, $end])
+            ->where('sales.status', 'completed')
+            ->groupBy('sale_items.product_id', 'month')
+            ->get();
+
+        if ($data->isEmpty()) return [];
+
+        $grouped = $data->groupBy('product_id');
+        $products = Product::whereIn('id', $grouped->keys())->get()->keyBy('id');
+
+        $results = [];
+        $currentMonth = now()->month;
+
+        foreach ($grouped as $productId => $rows) {
+            $product = $products[$productId];
+            $monthly = [];
+            foreach ($rows as $r) $monthly[$r->month] = $r->total_qty;
+
+            $total = array_sum($monthly);
+            if ($total < 10) continue;
+
+            $avg = $total / count($monthly);
+            arsort($monthly);
+
+            $peakMonth = array_key_first($monthly);
+            $peakQty = reset($monthly);
+
+            if ($peakQty < $avg * 1.2) continue;
+
+            $monthsUntil = ($peakMonth - $currentMonth + 12) % 12;
+            if ($monthsUntil < 1 || $monthsUntil > 2) continue;
+
+            $needed = max(($peakQty * 1.10) - $product->current_stock, 0);
+
+            $results[] = [
+                'product_id'    => $product->id,
+                'product_name'  => $product->name,
+                'peak_month'    => $peakMonth,
+                'peak_month_label' => Carbon::create(null, $peakMonth, 1)->format('F'),
+                'recommended_restock_display' => $this->formatQuantityForProduct($needed, $product),
+                'current_stock_display'       => $this->formatQuantityForProduct($product->current_stock, $product),
+            ];
+        }
+
+        return $results;
+    }
+
+    protected function getMonthlySales(int $months)
+    {
+        $start = now()->subMonths($months - 1)->startOfMonth();
+
+        $raw = Sale::selectRaw("
+                YEAR(sale_date) as year,
+                MONTH(sale_date) as month,
+                SUM(total_amount) as total
+            ")
+            ->where('status', 'completed')
+            ->where('sale_date', '>=', $start)
+            ->groupBy('year', 'month')
+            ->orderBy('year')
+            ->orderBy('month')
+            ->get();
+
+        $monthly = [];
+        $totals = [];
+
+        for ($i = $months - 1; $i >= 0; $i--) {
+            $date = now()->subMonths($i)->startOfMonth();
+            $found = $raw->first(fn($r) => $r->year == $date->year && $r->month == $date->month);
+            $total = $found ? $found->total : 0;
+
+            $monthly[] = [
+                'month' => $date->format('M Y'),
+                'total' => $total,
+            ];
+            $totals[] = $total;
+        }
+
+        for ($i = 0; $i < count($totals); $i++) {
+            $monthly[$i]['ma3'] = $i < 2 ? null : round(($totals[$i] + $totals[$i-1] + $totals[$i-2]) / 3, 2);
+        }
+
+        return $monthly;
+    }
+
+    protected function getStockForecast(array $sales, int $monthsAhead, int $window)
+    {
+        $history = collect($sales)->pluck('total')->values();
+        if ($history->count() < $window)
+            return $this->simpleAverageForecast($history->avg(), $monthsAhead);
+
+        $rolling = $history->toArray();
+        for ($i = 0; $i < $monthsAhead; $i++) {
+            $lastN = array_slice($rolling, -$window);
+            $rolling[] = array_sum($lastN) / $window;
+        }
+
+        $forecast = [];
+        $start = count($history);
+
+        for ($i = 1; $i <= $monthsAhead; $i++) {
+            $date = now()->addMonths($i);
+            $forecast[] = [
+                'month' => $date->format('M Y'),
+                'forecast' => round($rolling[$start + $i - 1], 2),
+            ];
+        }
+
+        return $forecast;
+    }
+
+    protected function simpleAverageForecast(float $avg, int $monthsAhead)
+    {
+        $out = [];
+        for ($i = 1; $i <= $monthsAhead; $i++) {
+            $out[] = [
+                'month' => now()->addMonths($i)->format('M Y'),
+                'forecast' => round($avg, 2),
+            ];
+        }
+        return $out;
+    }
 }

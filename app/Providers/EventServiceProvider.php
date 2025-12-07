@@ -1,7 +1,10 @@
 <?php
+
 namespace App\Providers;
 
-use Illuminate\Support\ServiceProvider;
+use Illuminate\Foundation\Support\Providers\EventServiceProvider as ServiceProvider;
+use App\Observers\AuditLogObserver;
+
 use App\Models\Product;
 use App\Models\Sale;
 use App\Models\Purchase;
@@ -10,20 +13,30 @@ use App\Models\User;
 use App\Models\ProductCategory;
 use App\Models\Brand;
 use App\Models\ProductBatch;
-use App\Observers\AuditLogObserver;
 
 class EventServiceProvider extends ServiceProvider
 {
-    public function boot()
+    /**
+     * The event listener mappings for the application.
+     *
+     * @var array<class-string, array<int, class-string>>
+     */
+    protected $listen = [
+        // you can keep your events here if you have any
+    ];
+
+    public function boot(): void
     {
-        // Register the observer for multiple models
-        Product::observe(AuditLogObserver::class);        // Track Product changes
-        Sale::observe(AuditLogObserver::class);           // Track Sale changes
-        Purchase::observe(AuditLogObserver::class);      // Track Purchase changes
-        StockMovement::observe(AuditLogObserver::class); // Track StockMovement changes
-        User::observe(AuditLogObserver::class);          // Track User changes
-        ProductCategory::observe(AuditLogObserver::class); // Track ProductCategory changes
-        Brand::observe(AuditLogObserver::class);          // Track Brand changes
-        ProductBatch::observe(AuditLogObserver::class);   // Track ProductBatch changes
+        parent::boot();
+
+        // Attach one observer to many models
+        Product::observe(AuditLogObserver::class);
+        Sale::observe(AuditLogObserver::class);
+        Purchase::observe(AuditLogObserver::class);
+        StockMovement::observe(AuditLogObserver::class);
+        User::observe(AuditLogObserver::class);
+        ProductCategory::observe(AuditLogObserver::class);
+        Brand::observe(AuditLogObserver::class);
+        ProductBatch::observe(AuditLogObserver::class);
     }
 }

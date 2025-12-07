@@ -1,10 +1,10 @@
 <?php
+
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
-use App\Models\AuditLog;  // Import the AuditLog model
 
 class Product extends Model
 {
@@ -38,7 +38,7 @@ class Product extends Model
     {
         return $this->belongsTo(Brand::class, 'brand_id');
     }
-    
+
     public function batches()
     {
         return $this->hasMany(ProductBatch::class);
@@ -59,37 +59,14 @@ class Product extends Model
         return $this->hasMany(StockMovement::class);
     }
 
-    // Model events to track changes for audit logging
-    protected static function booted()
-{
-    static::created(function ($product) {
-        AuditLog::create([
-            'table_name' => 'products',
-            'action' => 'created',
-            'user_id' => auth()->id(),  // Assuming you are using auth()
-            'old_data' => null,
-            'new_data' => json_encode($product->getAttributes()),
-        ]);
-    });
+    public function isFeed(): bool
+    {
+        if (! $this->category) {
+            return false;
+        }
 
-    static::updated(function ($product) {
-        AuditLog::create([
-            'table_name' => 'products',
-            'action' => 'updated',
-            'user_id' => auth()->id(),
-            'old_data' => json_encode($product->getOriginal()),
-            'new_data' => json_encode($product->getChanges()),
-        ]);
-    });
+        $name = strtolower($this->category->name);
 
-    static::deleted(function ($product) {
-        AuditLog::create([
-            'table_name' => 'products',
-            'action' => 'deleted',
-            'user_id' => auth()->id(),
-            'old_data' => json_encode($product->getOriginal()),
-            'new_data' => null,
-        ]);
-    });
-}
+        return in_array($name, ['feed', 'feeds']);
+    }
 }

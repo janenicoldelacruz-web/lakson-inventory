@@ -5,23 +5,54 @@
     <title>{{ $reportTitle ?? 'Inventory Report' }}</title>
     <style>
         body { font-family: sans-serif; font-size: 11px; }
+
         .header-table { width: 100%; }
         .header-left { text-align: left; }
         .header-right { text-align: right; font-size: 10px; }
 
-        .report-title { margin-top: 10px; text-align: center; font-size: 14px; font-weight: bold; }
-        .subtitle     { text-align: center; font-size: 11px; margin-top: 2px; }
+        .report-title {
+            margin-top: 10px;
+            text-align: center;
+            font-size: 14px;
+            font-weight: bold;
+        }
+        .subtitle {
+            text-align: center;
+            font-size: 11px;
+            margin-top: 2px;
+        }
 
-        table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-        th, td { border: 1px solid #ccc; padding: 5px; }
-        th { background-color: #f2f2f2; font-size: 11px; }
-        td { font-size: 10px; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 12px;
+        }
+        th, td {
+            border: 1px solid #ccc;
+            padding: 5px;
+        }
+        th {
+            background-color: #f2f2f2;
+            font-size: 11px;
+        }
+        td {
+            font-size: 10px;
+        }
+
         .text-right  { text-align: right; }
         .text-center { text-align: center; }
+
+        /* Category header row */
+        .category-row td {
+            background-color: #e6e6e6;
+            font-weight: bold;
+            font-size: 11px;
+        }
 
         .signatory-section { margin-top: 40px; width: 100%; }
         .signatory-table   { width: 100%; }
         .signatory-cell    { width: 33%; text-align: center; font-size: 11px; }
+
         .sign-line {
             margin-top: 40px;
             border-top: 1px solid #000;
@@ -43,6 +74,10 @@
                 <strong>{{ $company['name'] ?? 'Lakson Feed Trading' }}</strong><br>
                 {{ $company['address'] ?? 'San Guillermo, Isabela' }}<br>
                 {{ $company['contact'] ?? '09108655383' }}
+            </td>
+            <td class="header-right">
+                Date: {{ now()->format('F d, Y') }}<br>
+                Time: {{ now()->format('h:i A') }}
             </td>
         </tr>
     </table>
@@ -70,29 +105,74 @@
             </tr>
         </thead>
         <tbody>
-            @php $grandValue = 0; @endphp
+            @php
+                $grandValue = 0;
+                $currentCategoryId = null;
+                $SACK_WEIGHT_KG = 50; // 50kg per sack
+            @endphp
 
             @foreach ($products as $p)
-@php
-    $sacks      = (float) ($p->current_stock ?? 0); // from DB
-    $pcs        = 0;
-    $qty        = $sacks + $pcs;
-    $cost       = (float) ($p->cost_price ?? 0);
-    $sell       = (float) ($p->selling_price ?? $p->price ?? 0);
-    $totalValue = $qty * $cost;
-    $grandValue += $totalValue;
-@endphp
-<tr>
-    <td>{{ $p->name }}</td>
-    <td>{{ optional($p->category)->name }}</td>
-    <td>{{ optional($p->brand)->name }}</td>
-    <td class="text-right">{{ number_format($sacks, 2) }}</td>
-    <td class="text-right">{{ number_format($pcs, 2) }}</td>
-    <td class="text-right">{{ number_format($cost, 2) }}</td>
-    <td class="text-right">{{ number_format($sell, 2) }}</td>
-    <td class="text-right">{{ number_format($totalValue, 2) }}</td>
-</tr>
+                @php
+                    $category = $p->category;
+                    $categoryId = $category->id ?? null;
+                    $categoryName = $category->name ?? 'Uncategorized';
+                @endphp
 
+                {{-- CATEGORY HEADER ROW WHEN CATEGORY CHANGES --}}
+                @if ($categoryId !== $currentCategoryId)
+                    @php $currentCategoryId = $categoryId; @endphp
+                    <tr class="category-row">
+                        <td colspan="8">
+                            {{ strtoupper($categoryName) }}
+                        </td>
+                    </tr>
+                @endif
+
+                @php
+                    // --- STOCK & VALUE CALCULATION ---
+                    $currentStock = (float) ($p->current_stock ?? 0);
+                    $baseUnit     = (int) ($p->base_unit ?? 1); // 1 = Sack (feed), 2 = Piece
+
+                    $sacksDecimal = 0.0;
+                    $pieces       = 0;
+                    $qtyForValue  = 0.0;
+
+                    if ($baseUnit === 1) {
+                        // FEED: KG -> decimal sacks (e.g. 530kg = 10.6 sacks)
+                        $sacksDecimal = $SACK_WEIGHT_KG > 0 ? ($currentStock / $SACK_WEIGHT_KG) : 0;
+                        $pieces       = 0;
+                        $qtyForValue  = $sacksDecimal; // value per sack
+                    } else {
+                        // NON-FEED: pieces
+                        $sacksDecimal = 0.0;
+                        $pieces       = (int) $currentStock;
+                        $qtyForValue  = $pieces; // value per piece
+                    }
+
+                    $cost = (float) ($p->cost_price ?? 0);                 // per sack or piece
+                    $sell = (float) ($p->selling_price ?? $p->price ?? 0); // per sack or piece
+
+                    $totalValue  = $qtyForValue * $cost;
+                    $grandValue += $totalValue;
+                @endphp
+
+                <tr>
+                    <td>{{ $p->name }}</td>
+                    <td>{{ $categoryName }}</td>
+                    <td>{{ optional($p->brand)->name }}</td>
+
+                    {{-- Sacks column: show decimal with 1 decimal place (e.g. 10.6) --}}
+                    <td class="text-right">
+                        {{ $sacksDecimal > 0 ? number_format($sacksDecimal, 1) : '0.0' }}
+                    </td>
+
+                    {{-- Pieces: whole numbers --}}
+                    <td class="text-right">{{ number_format($pieces, 0) }}</td>
+
+                    <td class="text-right">{{ number_format($cost, 2) }}</td>
+                    <td class="text-right">{{ number_format($sell, 2) }}</td>
+                    <td class="text-right">{{ number_format($totalValue, 2) }}</td>
+                </tr>
             @endforeach
 
             <tr>

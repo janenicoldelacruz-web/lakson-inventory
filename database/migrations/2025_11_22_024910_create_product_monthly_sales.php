@@ -13,15 +13,16 @@ return new class extends Migration
             return;
         }
 
-        Schema::create('product_monthly_sales', function (Blueprint $table) {
-            $table->id();
-            $table->foreignId('product_id')->constrained()->cascadeOnDelete();
-            $table->integer('year');
-            $table->integer('month');
-            $table->decimal('total_quantity_sold', 12, 2)->default(0);
-            $table->decimal('total_sales_amount', 12, 2)->default(0);
-            $table->timestamps();
-        });
+       Schema::create('product_monthly_sales', function (Blueprint $table) {
+    $table->id();
+    $table->foreignId('product_id')->constrained()->cascadeOnDelete();
+    $table->integer('year');
+    $table->integer('month');
+    $table->integer('total_quantity_sold')->default(0);  // whole number
+    $table->decimal('total_sales_amount', 12, 2)->default(0);
+    $table->timestamps();
+});
+
     }
 
     public function down(): void

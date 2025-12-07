@@ -3,58 +3,60 @@
 namespace App\Observers;
 
 use App\Models\AuditLog;
-use Illuminate\Database\Eloquent\Model;
 
 class AuditLogObserver
 {
-    // Handle the created event
-    public function created(Model $model)
+    protected function log(string $event, $model, ?array $changes = null): void
     {
-        // Check if the user is authenticated
-        $user = auth()->user();  // This retrieves the currently authenticated user
-        
-        // If no user is authenticated, set $user to null or a default system value (e.g., 0)
-        $userId = $user ? $user->id : 0;  // Use 0 or null for system actions
+        $user    = auth()->user();
+        $request = request();
 
         AuditLog::create([
-            'action' => 'created',
-            'user_id' => $userId, // Use the user_id or system ID
-            'entity_type' => get_class($model), // Dynamically set the entity type (e.g., 'Product', 'Sale')
-            'entity_id' => $model->id, // Use the model’s ID
-            'changes' => json_encode($model->getAttributes()), // New data for creation
+            'user_id'     => $user?->id,
+            'action'      => strtolower(class_basename($model)) . '_' . $event,
+            'entity_type' => get_class($model),
+            'entity_id'   => $model->getKey(),
+            'changes'     => $changes,
+            'ip_address'  => $request?->ip(),
+            'user_agent'  => $request?->userAgent(),
+            'meta'        => [
+                'url'    => $request?->fullUrl(),
+                'method' => $request?->method(),
+            ],
         ]);
     }
 
-    // Handle the updated event
-    public function updated(Model $model)
+    public function created($model): void
     {
-        $user = auth()->user(); // Retrieve the authenticated user
-        $userId = $user ? $user->id : 0; // Default to 0 if no user is authenticated
+        // TEMP: prove this observer is firing
+       // dd('AuditLogObserver CREATED fired', get_class($model), $model->id);
 
-        AuditLog::create([
-            'action' => 'updated',
-            'user_id' => $userId, // Use the user_id or system ID
-            'entity_type' => get_class($model),
-            'entity_id' => $model->id,
-            'changes' => json_encode([
-                'old' => $model->getOriginal(), // Old data for update
-                'new' => $model->getChanges(),  // New data for update
-            ]),
+        $this->log('created', $model, [
+            'new' => $model->getAttributes(),
         ]);
     }
 
-    // Handle the deleted event
-    public function deleted(Model $model)
+    public function updated($model): void
     {
-        $user = auth()->user(); // Retrieve the authenticated user
-        $userId = $user ? $user->id : 0; // Default to 0 if no user is authenticated
-
-        AuditLog::create([
-            'action' => 'deleted',
-            'user_id' => $userId, // Use the user_id or system ID
-            'entity_type' => get_class($model),
-            'entity_id' => $model->id,
-            'changes' => json_encode($model->getOriginal()), // Data before deletion
+        $this->log('updated', $model, [
+            'old'   => $model->getOriginal(),
+            'new'   => $model->getAttributes(),
+            'dirty' => $model->getChanges(),
         ]);
+    }
+
+    public function deleted($model): void
+    {
+        $this->log('deleted', $model);
+    }
+
+    public function restored($model): void
+    {
+        $this->log('restored', $model);
+    }
+
+    public function forceDeleted($model): void
+    {
+        $this->log('force_deleted', $model);
     }
 }

@@ -8,26 +8,29 @@ return new class extends Migration {
     public function up(): void
     {
         Schema::create('stock_movements', function (Blueprint $table) {
-            $table->id();
+    $table->id();
 
-            $table->foreignId('product_id')
-                ->constrained()
-                ->cascadeOnDelete();
+    $table->foreignId('product_id')
+        ->constrained()
+        ->cascadeOnDelete();
 
-            $table->foreignId('batch_id')
-                ->nullable()
-                ->constrained('product_batches')
-                ->nullOnDelete();
+    $table->foreignId('batch_id')
+        ->nullable()
+        ->constrained('product_batches')
+        ->nullOnDelete();
 
-            $table->string('movement_type', 50);
-            $table->string('reference_type', 50)->nullable();
-            $table->unsignedBigInteger('reference_id')->nullable();
+    $table->string('movement_type', 50);
+    $table->string('reference_type', 50)->nullable();
+    $table->unsignedBigInteger('reference_id')->nullable();
 
-            $table->decimal('quantity_change', 12, 2);
-            $table->string('remarks')->nullable();
+    // Whole-number stock adjustment
+    $table->integer('quantity_change');
 
-            $table->timestamps();
-        });
+    $table->string('remarks')->nullable();
+
+    $table->timestamps();
+});
+
     }
 
     public function down(): void
